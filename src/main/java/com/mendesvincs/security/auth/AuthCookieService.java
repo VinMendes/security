@@ -6,137 +6,239 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 /**
- * Serviço responsável por gerenciar o cookie de autenticação da aplicação.
+ * Serviço responsável por gerenciar os cookies de autenticação da aplicação.
  *
  * <p>
- * Esse serviço encapsula toda a lógica relacionada à criação,
- * configuração e remoção do cookie que armazena o token JWT.
- * </p>
- *
- * <p>
- * A estratégia adotada é:
- * <strong>armazenar o JWT em um cookie HttpOnly</strong>.
- * Isso aumenta a segurança, pois o token não fica acessível via JavaScript
- * (reduzindo risco de XSS).
- * </p>
- *
- * <p>
- * As configurações do cookie (nome e flag secure) são externas
- * e vêm do application.properties:
+ * Neste projeto utilizamos um modelo baseado em <strong>2 tokens</strong>:
  * </p>
  *
  * <ul>
- *     <li>app.cookie.name → nome do cookie</li>
- *     <li>app.cookie.secure → define se o cookie só será enviado via HTTPS</li>
+ *     <li><strong>Access Token</strong> → usado para acessar rotas protegidas</li>
+ *     <li><strong>Refresh Token</strong> → usado apenas para gerar um novo access token</li>
+ * </ul>
+ *
+ * <p>
+ * Ambos são armazenados no cliente através de <strong>cookies HttpOnly</strong>.
+ * Isso significa que o token não pode ser acessado via JavaScript,
+ * reduzindo significativamente o risco de ataques XSS.
+ * </p>
+ *
+ * <h2>Responsabilidades desta classe</h2>
+ * <ul>
+ *     <li>Criar cookies de autenticação (access e refresh)</li>
+ *     <li>Remover cookies no logout</li>
+ *     <li>Centralizar configuração de segurança do cookie</li>
+ * </ul>
+ *
+ * <p>
+ * Centralizar essa lógica em um serviço evita duplicação de código
+ * e facilita manutenção caso as regras de cookie mudem.
+ * </p>
+ *
+ * <h2>Configuração externa</h2>
+ *
+ * Os valores são carregados do {@code application.properties}:
+ *
+ * <ul>
+ *     <li>{@code app.cookie.accessName} → nome do cookie do access token</li>
+ *     <li>{@code app.cookie.refreshName} → nome do cookie do refresh token</li>
+ *     <li>{@code app.cookie.secure} → define se o cookie só será enviado via HTTPS</li>
  * </ul>
  *
  * <p>
  * Em produção, o ideal é:
- * <ul>
- *     <li>secure = true</li>
- *     <li>usar HTTPS obrigatório</li>
- *     <li>definir SameSite adequadamente</li>
- * </ul>
  * </p>
+ *
+ * <ul>
+ *     <li>{@code secure = true}</li>
+ *     <li>usar HTTPS obrigatório</li>
+ *     <li>configurar SameSite adequadamente</li>
+ * </ul>
  */
 @Service
 public class AuthCookieService {
 
     /**
-     * Nome do cookie que armazenará o token JWT.
+     * Nome do cookie que armazenará o Access Token.
+     *
+     * <p>
+     * O Access Token é utilizado pelo filtro de autenticação
+     * para validar o usuário em cada requisição protegida.
+     * </p>
      */
-    private final String cookieName;
+    private final String accessCookieName;
 
     /**
-     * Define se o cookie será enviado apenas via HTTPS.
-     * Deve ser true em produção.
+     * Nome do cookie que armazenará o Refresh Token.
+     *
+     * <p>
+     * O Refresh Token não é usado diretamente para autenticar
+     * endpoints protegidos. Ele é utilizado apenas na rota
+     * {@code /auth/refresh} para gerar um novo Access Token.
+     * </p>
+     */
+    private final String refreshCookieName;
+
+    /**
+     * Define se o cookie será enviado apenas em conexões HTTPS.
+     *
+     * <p>
+     * Quando {@code true}, o navegador só envia o cookie se a
+     * requisição for feita via HTTPS.
+     * </p>
+     *
+     * <p>
+     * Em ambiente de desenvolvimento normalmente usamos {@code false},
+     * pois o servidor local roda em HTTP.
+     * </p>
      */
     private final boolean secure;
 
     /**
      * Construtor com injeção de propriedades externas.
      *
-     * @param cookieName nome do cookie definido no application.properties
-     * @param secure define se o cookie é seguro (HTTPS only)
+     * @param accessCookieName nome do cookie do access token
+     * @param refreshCookieName nome do cookie do refresh token
+     * @param secure define se o cookie é enviado apenas via HTTPS
      */
     public AuthCookieService(
-            @Value("${app.cookie.name}") String cookieName,
+            @Value("${app.cookie.accessName}") String accessCookieName,
+            @Value("${app.cookie.refreshName}") String refreshCookieName,
             @Value("${app.cookie.secure}") boolean secure
     ) {
-        this.cookieName = cookieName;
+        this.accessCookieName = accessCookieName;
+        this.refreshCookieName = refreshCookieName;
         this.secure = secure;
     }
 
     /**
-     * Cria e adiciona o cookie de autenticação na resposta HTTP.
+     * Cria e adiciona o cookie do Access Token na resposta HTTP.
      *
      * <p>
-     * O cookie é configurado com:
-     * <ul>
-     *     <li>HttpOnly = true → impede acesso via JavaScript</li>
-     *     <li>Secure = configurável → apenas HTTPS quando true</li>
-     *     <li>Path = "/" → válido para toda aplicação</li>
-     *     <li>MaxAge = tempo de vida em segundos</li>
-     * </ul>
+     * O Access Token é utilizado pelo filtro de segurança para
+     * autenticar o usuário em rotas protegidas.
      * </p>
      *
-     * @param response objeto da resposta HTTP
-     * @param token token JWT gerado no login
+     * @param response resposta HTTP atual
+     * @param token token JWT do tipo access
      * @param maxAgeSeconds tempo de vida do cookie em segundos
      */
-    public void setAuthCookie(HttpServletResponse response, String token, int maxAgeSeconds) {
-        Cookie cookie = new Cookie(cookieName, token);
+    public void setAccessCookie(HttpServletResponse response, String token, int maxAgeSeconds) {
+        response.addCookie(buildCookie(accessCookieName, token, maxAgeSeconds));
+    }
+
+    /**
+     * Cria e adiciona o cookie do Refresh Token na resposta HTTP.
+     *
+     * <p>
+     * O Refresh Token é usado apenas para renovar o Access Token
+     * quando ele expira.
+     * </p>
+     *
+     * @param response resposta HTTP atual
+     * @param token token JWT do tipo refresh
+     * @param maxAgeSeconds tempo de vida do cookie em segundos
+     */
+    public void setRefreshCookie(HttpServletResponse response, String token, int maxAgeSeconds) {
+        response.addCookie(buildCookie(refreshCookieName, token, maxAgeSeconds));
+    }
+
+    /**
+     * Remove o cookie do Access Token.
+     *
+     * <p>
+     * A remoção ocorre definindo:
+     * </p>
+     *
+     * <ul>
+     *     <li>valor vazio</li>
+     *     <li>MaxAge = 0</li>
+     * </ul>
+     *
+     * <p>
+     * Isso instrui o navegador a apagar o cookie imediatamente.
+     * </p>
+     *
+     * @param response resposta HTTP atual
+     */
+    public void clearAccessCookie(HttpServletResponse response) {
+        response.addCookie(buildCookie(accessCookieName, "", 0));
+    }
+
+    /**
+     * Remove o cookie do Refresh Token.
+     *
+     * @param response resposta HTTP atual
+     */
+    public void clearRefreshCookie(HttpServletResponse response) {
+        response.addCookie(buildCookie(refreshCookieName, "", 0));
+    }
+
+    /**
+     * Remove todos os cookies de autenticação da aplicação.
+     *
+     * <p>
+     * Utilizado no fluxo de logout para limpar completamente
+     * o estado de autenticação do cliente.
+     * </p>
+     *
+     * @param response resposta HTTP atual
+     */
+    public void clearAuthCookies(HttpServletResponse response) {
+        clearAccessCookie(response);
+        clearRefreshCookie(response);
+    }
+
+    /**
+     * Constrói um cookie com as configurações padrão de segurança.
+     *
+     * <p>
+     * Todos os cookies criados por este serviço compartilham
+     * as seguintes configurações:
+     * </p>
+     *
+     * <ul>
+     *     <li><strong>HttpOnly</strong> → impede acesso via JavaScript</li>
+     *     <li><strong>Secure</strong> → envia apenas via HTTPS (quando true)</li>
+     *     <li><strong>Path=/</strong> → cookie válido para toda aplicação</li>
+     *     <li><strong>MaxAge</strong> → tempo de vida em segundos</li>
+     * </ul>
+     *
+     * @param name nome do cookie
+     * @param value valor do cookie (token JWT)
+     * @param maxAgeSeconds tempo de vida do cookie
+     * @return objeto {@link Cookie} configurado
+     */
+    private Cookie buildCookie(String name, String value, int maxAgeSeconds) {
+        Cookie cookie = new Cookie(name, value);
         cookie.setHttpOnly(true);
         cookie.setSecure(secure);
         cookie.setPath("/");
         cookie.setMaxAge(maxAgeSeconds);
-
-        // Observação:
-        // SameSite não é configurável diretamente via javax/jakarta Cookie clássico.
-        // Caso necessário, pode ser definido manualmente via header "Set-Cookie".
-        response.addCookie(cookie);
+        return cookie;
     }
 
     /**
-     * Remove o cookie de autenticação.
+     * Retorna o nome do cookie do Access Token.
      *
      * <p>
-     * A remoção ocorre definindo:
-     * <ul>
-     *     <li>Valor vazio</li>
-     *     <li>MaxAge = 0</li>
-     * </ul>
+     * Esse método é utilizado principalmente pelo filtro
+     * de autenticação para localizar o token correto
+     * na requisição HTTP.
      * </p>
      *
-     * <p>
-     * Como a aplicação é stateless, não há invalidação de sessão
-     * no servidor. O logout consiste apenas em remover o cookie
-     * do cliente.
-     * </p>
-     *
-     * @param response objeto da resposta HTTP
+     * @return nome do cookie do access token
      */
-    public void clearAuthCookie(HttpServletResponse response) {
-        Cookie cookie = new Cookie(cookieName, "");
-        cookie.setHttpOnly(true);
-        cookie.setSecure(secure);
-        cookie.setPath("/");
-        cookie.setMaxAge(0);
-
-        response.addCookie(cookie);
+    public String getAccessCookieName() {
+        return accessCookieName;
     }
 
     /**
-     * Retorna o nome do cookie configurado.
+     * Retorna o nome do cookie do Refresh Token.
      *
-     * <p>
-     * Esse método é utilizado pelo filtro de autenticação
-     * para localizar o cookie correto na requisição.
-     * </p>
-     *
-     * @return nome do cookie de autenticação
+     * @return nome do cookie do refresh token
      */
-    public String getCookieName() {
-        return cookieName;
+    public String getRefreshCookieName() {
+        return refreshCookieName;
     }
 }
